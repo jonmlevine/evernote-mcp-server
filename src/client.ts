@@ -30,7 +30,7 @@ import type {
   OcrRecognition,
   ResourceOcrContents,
 } from "./types.js";
-import { refreshTokens, saveTokens } from "./auth.js";
+import { refreshTokens as refreshAuthTokens, saveTokens as saveAuthTokens } from "./auth.js";
 import { selectGetNoteBackend } from "./evernote-version.js";
 import {
   addAttachmentViaNoteStore,
@@ -101,6 +101,23 @@ query ResourceRecognitions($id: String!) {
     searchText
   }
 }`;
+
+type AuthRefreshFn = (tokens: AuthTokens) => Promise<AuthTokens>;
+type AuthSaveFn = (tokens: AuthTokens, path?: string) => Promise<void>;
+
+type ClientAuthOptions = {
+  refreshTokens?: AuthRefreshFn;
+  saveTokens?: AuthSaveFn;
+};
+
+export function isNoteStoreAuthExpiredResponse(response: ApiResponse<unknown>): boolean {
+  return (
+    !response.ok &&
+    typeof response.error === "string" &&
+    response.error.includes("EDAMUserException: AUTH_EXPIRED (9)") &&
+    response.error.includes("parameter=authenticationToken")
+  );
+}
 
 type GraphQLError = {
   message?: string;
@@ -182,10 +199,14 @@ function mapQuasarResourceOcr(resource: QuasarResourceOcr): NoteResourceOcr {
 export class EvernoteClient {
   private tokens: AuthTokens;
   private tokenPath?: string;
+  private refreshAuthTokens: AuthRefreshFn;
+  private saveAuthTokens: AuthSaveFn;
 
-  constructor(tokens: AuthTokens, tokenPath?: string) {
+  constructor(tokens: AuthTokens, tokenPath?: string, authOptions: ClientAuthOptions = {}) {
     this.tokens = tokens;
     this.tokenPath = tokenPath;
+    this.refreshAuthTokens = authOptions.refreshTokens || refreshAuthTokens;
+    this.saveAuthTokens = authOptions.saveTokens || saveAuthTokens;
   }
 
   // ─── Internal HTTP helpers ───────────────────────────────
@@ -204,15 +225,38 @@ export class EvernoteClient {
     // Refresh if token expires within 60 seconds
     if (this.tokens.expiresAt < Date.now() + 60_000 && this.tokens.refreshToken) {
       try {
-        this.tokens = await refreshTokens(this.tokens);
-        if (this.tokenPath) {
-          await saveTokens(this.tokens, this.tokenPath);
-        }
+        await this.refreshAndSaveTokens();
       } catch {
         // If refresh fails, continue with existing token
         // The server will return 401 and the caller can re-authenticate
       }
     }
+  }
+
+  private async refreshAndSaveTokens(): Promise<void> {
+    this.tokens = await this.refreshAuthTokens(this.tokens);
+    if (this.tokenPath) {
+      await this.saveAuthTokens(this.tokens, this.tokenPath);
+    }
+  }
+
+  private async noteStoreRequest<T>(
+    operation: () => Promise<ApiResponse<T>>
+  ): Promise<ApiResponse<T>> {
+    await this.ensureValidToken();
+
+    const result = await operation();
+    if (!isNoteStoreAuthExpiredResponse(result) || !this.tokens.refreshToken) {
+      return result;
+    }
+
+    try {
+      await this.refreshAndSaveTokens();
+    } catch {
+      return result;
+    }
+
+    return operation();
   }
 
   private async request<T>(
@@ -374,17 +418,17 @@ export class EvernoteClient {
 
   /** List all notebooks */
   async listNotebooks(): Promise<ApiResponse<Notebook[]>> {
-    return listNotebooksViaNoteStore(this.tokens);
+    return this.noteStoreRequest(() => listNotebooksViaNoteStore(this.tokens));
   }
 
   /** List all tags */
   async listTags(): Promise<ApiResponse<Tag[]>> {
-    return listTagsViaNoteStore(this.tokens);
+    return this.noteStoreRequest(() => listTagsViaNoteStore(this.tokens));
   }
 
   /** List recently updated notes with metadata. */
   async listNotes(maxResults: number = 50): Promise<ApiResponse<SearchResult[]>> {
-    return listNotesViaNoteStore(this.tokens, maxResults);
+    return this.noteStoreRequest(() => listNotesViaNoteStore(this.tokens, maxResults));
   }
 
   // ─── Get by ID ──────────────────────────────────────────
@@ -395,7 +439,9 @@ export class EvernoteClient {
     options: { includeContent?: boolean } = {}
   ): Promise<ApiResponse<Note>> {
     if (selectGetNoteBackend() === "notestore") {
-      return getNoteViaNoteStore(this.tokens, noteId, options.includeContent !== false);
+      return this.noteStoreRequest(() =>
+        getNoteViaNoteStore(this.tokens, noteId, options.includeContent !== false)
+      );
     }
 
     return this.request<Note>(
@@ -406,7 +452,7 @@ export class EvernoteClient {
 
   /** Get a single notebook by ID */
   async getNotebook(notebookId: string): Promise<ApiResponse<Notebook>> {
-    return getNotebookViaNoteStore(this.tokens, notebookId);
+    return this.noteStoreRequest(() => getNotebookViaNoteStore(this.tokens, notebookId));
   }
 
   // ─── Notes ───────────────────────────────────────────────
@@ -446,7 +492,7 @@ export class EvernoteClient {
    * doesn't expose a direct update — updates go through Conduit/NSync.
    */
   async updateNote(params: UpdateNoteParams): Promise<ApiResponse<Note>> {
-    return updateNoteViaNoteStore(this.tokens, params);
+    return this.noteStoreRequest(() => updateNoteViaNoteStore(this.tokens, params));
   }
 
   /**
@@ -454,7 +500,7 @@ export class EvernoteClient {
    * Uses the NSync command service.
    */
   async deleteNote(noteId: string): Promise<ApiResponse<void>> {
-    return deleteNoteViaNoteStore(this.tokens, noteId);
+    return this.noteStoreRequest(() => deleteNoteViaNoteStore(this.tokens, noteId));
   }
 
   /** Request access to a shared note */
@@ -486,12 +532,12 @@ export class EvernoteClient {
   async createNotebook(
     params: CreateNotebookParams
   ): Promise<ApiResponse<Notebook>> {
-    return createNotebookViaNoteStore(this.tokens, params);
+    return this.noteStoreRequest(() => createNotebookViaNoteStore(this.tokens, params));
   }
 
   /** Delete a notebook by ID */
   async deleteNotebook(notebookId: string): Promise<ApiResponse<void>> {
-    return deleteNotebookViaNoteStore(this.tokens, notebookId);
+    return this.noteStoreRequest(() => deleteNotebookViaNoteStore(this.tokens, notebookId));
   }
 
   // ─── Tags ────────────────────────────────────────────────
@@ -501,7 +547,7 @@ export class EvernoteClient {
    * Uses the NSync command service.
    */
   async createTag(params: CreateTagParams): Promise<ApiResponse<Tag>> {
-    return createTagViaNoteStore(this.tokens, params);
+    return this.noteStoreRequest(() => createTagViaNoteStore(this.tokens, params));
   }
 
   /** Update a tag's name or parent */
@@ -509,7 +555,7 @@ export class EvernoteClient {
     tagId: string,
     params: Partial<CreateTagParams>
   ): Promise<ApiResponse<Tag>> {
-    return updateTagViaNoteStore(this.tokens, tagId, params);
+    return this.noteStoreRequest(() => updateTagViaNoteStore(this.tokens, tagId, params));
   }
 
   // ─── Search ──────────────────────────────────────────────
@@ -594,7 +640,7 @@ export class EvernoteClient {
 
   /** List metadata for resources/attachments attached to a note. */
   async listAttachments(noteId: string): Promise<ApiResponse<Attachment[]>> {
-    return listAttachmentsViaNoteStore(this.tokens, noteId);
+    return this.noteStoreRequest(() => listAttachmentsViaNoteStore(this.tokens, noteId));
   }
 
   /**
@@ -604,7 +650,7 @@ export class EvernoteClient {
   async addAttachment(
     params: CreateAttachmentParams
   ): Promise<ApiResponse<Attachment>> {
-    return addAttachmentViaNoteStore(this.tokens, params);
+    return this.noteStoreRequest(() => addAttachmentViaNoteStore(this.tokens, params));
   }
 
   /**
@@ -614,7 +660,7 @@ export class EvernoteClient {
     resourceId: string,
     options: { includeData?: boolean } = {}
   ): Promise<ApiResponse<AttachmentData>> {
-    return getAttachmentViaNoteStore(this.tokens, resourceId, options);
+    return this.noteStoreRequest(() => getAttachmentViaNoteStore(this.tokens, resourceId, options));
   }
 
   // ─── Workspaces (Spaces) ─────────────────────────────────
@@ -745,7 +791,9 @@ export class EvernoteClient {
   ): Promise<ApiResponse<ResourceOcrContents>> {
     let noteId = options.noteId;
     if (!noteId) {
-      const resource = await getResourceMetadataViaNoteStore(this.tokens, resourceId);
+      const resource = await this.noteStoreRequest(() =>
+        getResourceMetadataViaNoteStore(this.tokens, resourceId)
+      );
       if (!resource.ok) {
         return {
           ok: false,

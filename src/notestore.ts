@@ -34,6 +34,13 @@ const Types = require(
 const NoteStoreTypes = require(
   fileURLToPath(new URL("../vendor/evernote-thrift/NoteStore_types.js", import.meta.url))
 );
+const Errors = require(
+  fileURLToPath(new URL("../vendor/evernote-thrift/Errors_types.js", import.meta.url))
+);
+
+const EDAM_ERROR_CODES_BY_VALUE = new Map<number, string>(
+  Object.entries(Errors.EDAMErrorCode || {}).map(([name, value]) => [Number(value), name])
+);
 
 type RawNotebook = {
   guid?: string;
@@ -273,8 +280,34 @@ async function callNoteStore<T>(
   });
 }
 
+export function formatNoteStoreError(error: unknown): string {
+  if (!error || typeof error !== "object") {
+    return String(error);
+  }
+
+  const details = error as {
+    name?: string;
+    message?: string;
+    errorCode?: number;
+    parameter?: string;
+    rateLimitDuration?: number;
+  };
+  const fallback = details.message || details.name || "Unknown NoteStore error";
+  if (!details.name?.startsWith("EDAM") || typeof details.errorCode !== "number") {
+    return fallback;
+  }
+
+  const codeName = EDAM_ERROR_CODES_BY_VALUE.get(details.errorCode) || "UNKNOWN";
+  const fields = [`${details.name}: ${codeName} (${details.errorCode})`];
+  if (details.parameter) fields.push(`parameter=${details.parameter}`);
+  if (typeof details.rateLimitDuration === "number") {
+    fields.push(`rateLimitDuration=${details.rateLimitDuration}`);
+  }
+  return fields.join("; ");
+}
+
 function errorResponse<T>(error: unknown, status = 500): ApiResponse<T> {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = formatNoteStoreError(error);
   return {
     ok: false,
     status,
